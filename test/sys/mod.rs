@@ -52,6 +52,8 @@ mod test_fanotify;
 #[cfg(target_os = "linux")]
 mod test_inotify;
 mod test_pthread;
+#[cfg(target_os = "linux")]
+mod test_quota;
 
 #[cfg(any(linux_android, freebsdlike, netbsdlike, apple_targets))]
 mod test_ptrace;

@@ -16,6 +16,8 @@ use crate::errno::Errno;
 use crate::{NixPath, Result};
 use libc::{self, c_char, c_int};
 use std::default::Default;
+#[cfg(linux_android)]
+use std::os::fd::{AsFd, AsRawFd};
 use std::{mem, ptr};
 
 struct QuotaCmd(QuotaSubCmd, QuotaType);
@@ -35,20 +37,199 @@ libc_enum! {
         Q_QUOTAOFF,
         Q_GETQUOTA,
         Q_SETQUOTA,
+        Q_GETINFO,
     }
 }
 
-libc_enum! {
-    /// The scope of the quota.
-    #[repr(i32)]
-    #[non_exhaustive]
-    pub enum QuotaType {
-        /// Specify a user quota
-        USRQUOTA,
-        /// Specify a group quota
-        GRPQUOTA,
+/// The scope of the quota.
+///
+/// `PRJQUOTA` is a Linux UAPI constant which is not yet exposed by libc.
+#[repr(i32)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum QuotaType {
+    /// Specify a user quota.
+    USRQUOTA = libc::USRQUOTA,
+    /// Specify a group quota.
+    GRPQUOTA = libc::GRPQUOTA,
+    /// Specify a project quota (Linux only).
+    #[cfg(linux_android)]
+    PRJQUOTA = 2,
+}
+
+impl TryFrom<i32> for QuotaType {
+    type Error = crate::Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match value {
+            libc::USRQUOTA => Ok(Self::USRQUOTA),
+            libc::GRPQUOTA => Ok(Self::GRPQUOTA),
+            #[cfg(linux_android)]
+            2 => Ok(Self::PRJQUOTA),
+            _ => Err(Errno::EINVAL),
+        }
     }
 }
+
+/// A Linux project identifier accepted by `quotactl`.
+///
+/// Linux stores project identifiers as `u32`, but the `quotactl` ABI accepts
+/// its identifier in a signed `int`.  Values greater than `i32::MAX` are
+/// therefore rejected instead of being silently reinterpreted.
+#[cfg(linux_android)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectId(u32);
+
+#[cfg(linux_android)]
+impl ProjectId {
+    /// Construct a project identifier which is representable by `quotactl`.
+    pub fn new(id: u32) -> Result<Self> {
+        if id > c_int::MAX as u32 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(Self(id))
+    }
+
+    /// Return the Linux project identifier.
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Project attributes associated with an inode or directory.
+#[cfg(linux_android)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectAttributes {
+    project_id: ProjectId,
+    project_inherit: bool,
+}
+
+#[cfg(linux_android)]
+impl ProjectAttributes {
+    /// Project identifier assigned to this inode.
+    pub fn project_id(self) -> ProjectId {
+        self.project_id
+    }
+
+    /// Whether new children inherit this directory's project identifier.
+    pub fn project_inherit(self) -> bool {
+        self.project_inherit
+    }
+}
+
+/// Exact finite project quota limits in bytes.
+///
+/// Linux quota block limits are measured in 1024-byte units.  This type does
+/// not permit zero (unlimited) limits or inexact byte values.
+#[cfg(linux_android)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectQuota {
+    soft_limit_bytes: u64,
+    hard_limit_bytes: u64,
+}
+
+/// Information returned by the active Linux project-quota interface.
+#[cfg(linux_android)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectQuotaInfo {
+    flags: u32,
+}
+
+#[cfg(linux_android)]
+impl ProjectQuotaInfo {
+    /// Filesystem-specific quota flags reported by `Q_GETINFO`.
+    pub fn flags(self) -> u32 {
+        self.flags
+    }
+}
+
+#[cfg(linux_android)]
+impl ProjectQuota {
+    /// Construct finite, exactly representable soft and hard byte limits.
+    pub fn new(soft_limit_bytes: u64, hard_limit_bytes: u64) -> Result<Self> {
+        quota_blocks_from_bytes(soft_limit_bytes)?;
+        quota_blocks_from_bytes(hard_limit_bytes)?;
+        Ok(Self {
+            soft_limit_bytes,
+            hard_limit_bytes,
+        })
+    }
+
+    /// The finite soft limit in bytes.
+    pub fn soft_limit_bytes(self) -> u64 {
+        self.soft_limit_bytes
+    }
+
+    /// The finite hard limit in bytes.
+    pub fn hard_limit_bytes(self) -> u64 {
+        self.hard_limit_bytes
+    }
+
+    fn from_dqblk(dqblk: &Dqblk) -> Result<Self> {
+        if !QuotaValidFlags::from_bits_truncate(dqblk.0.dqb_valid)
+            .contains(QuotaValidFlags::QIF_BLIMITS)
+        {
+            return Err(Errno::EINVAL);
+        }
+        Self::new(
+            quota_bytes_from_blocks(dqblk.0.dqb_bsoftlimit)?,
+            quota_bytes_from_blocks(dqblk.0.dqb_bhardlimit)?,
+        )
+    }
+}
+
+/// Convert a finite exact byte limit to Linux quota blocks.
+#[cfg(linux_android)]
+pub fn quota_blocks_from_bytes(bytes: u64) -> Result<u64> {
+    const QUOTA_BLOCK_BYTES: u64 = 1024;
+    if bytes == 0 || bytes % QUOTA_BLOCK_BYTES != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(bytes / QUOTA_BLOCK_BYTES)
+}
+
+/// Convert a finite Linux quota-block limit to exact bytes.
+#[cfg(linux_android)]
+pub fn quota_bytes_from_blocks(blocks: u64) -> Result<u64> {
+    const QUOTA_BLOCK_BYTES: u64 = 1024;
+    if blocks == 0 {
+        return Err(Errno::EINVAL);
+    }
+    blocks.checked_mul(QUOTA_BLOCK_BYTES).ok_or(Errno::EINVAL)
+}
+
+// The Linux UAPI has not yet exposed these two payload types through libc.
+// Keep them private: callers only receive the project-specific safe view.
+#[cfg(linux_android)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Fsxattr {
+    fsx_xflags: u32,
+    fsx_extsize: u32,
+    fsx_nextents: u32,
+    fsx_projid: u32,
+    fsx_cowextsize: u32,
+    fsx_pad: [u8; 8],
+}
+
+#[cfg(linux_android)]
+#[repr(C)]
+struct Dqinfo {
+    dqi_bgrace: u64,
+    dqi_igrace: u64,
+    dqi_flags: u32,
+    dqi_valid: u32,
+}
+
+#[cfg(linux_android)]
+const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
+
+// FS_IOC_FSGETXATTR and FS_IOC_FSSETXATTR, encoded from Linux _IOR/_IOW.
+// libc owns the per-architecture ioctl layout and request ABI type.
+#[cfg(linux_android)]
+const FS_IOC_FSGETXATTR: libc::Ioctl = libc::_IOR::<Fsxattr>(b'X' as u32, 31);
+#[cfg(linux_android)]
+const FS_IOC_FSSETXATTR: libc::Ioctl = libc::_IOW::<Fsxattr>(b'X' as u32, 32);
 
 libc_enum! {
     /// The type of quota format to use.
@@ -255,6 +436,71 @@ fn quotactl<P: ?Sized + NixPath>(
     }
 }
 
+#[cfg(linux_android)]
+fn fsxattr_get<Fd: AsFd>(fd: Fd) -> Result<Fsxattr> {
+    let mut attributes = Fsxattr::default();
+    // FS_IOC_FSGETXATTR has a fixed request number and a pointer to our
+    // ABI-checked `Fsxattr`; the buffer is live and writable for this call.
+    let result = unsafe {
+        libc::ioctl(
+            fd.as_fd().as_raw_fd(),
+            FS_IOC_FSGETXATTR,
+            (&mut attributes as *mut Fsxattr).cast::<libc::c_void>(),
+        )
+    };
+    Errno::result(result).map(|_| attributes)
+}
+
+#[cfg(linux_android)]
+fn fsxattr_set<Fd: AsFd>(fd: Fd, attributes: &Fsxattr) -> Result<()> {
+    // FS_IOC_FSSETXATTR has a fixed request number and `attributes` remains
+    // valid and immutable for the duration of this synchronous ioctl.
+    let result = unsafe {
+        libc::ioctl(
+            fd.as_fd().as_raw_fd(),
+            FS_IOC_FSSETXATTR,
+            (attributes as *const Fsxattr).cast::<libc::c_void>(),
+        )
+    };
+    Errno::result(result).map(drop)
+}
+
+/// Read a file or directory's Linux project identifier and inheritance bit.
+///
+/// Filesystems which do not implement `FS_IOC_FSGETXATTR` return their normal
+/// filesystem error, commonly `EINVAL`, `ENOTTY`, or `EOPNOTSUPP`.
+#[cfg(linux_android)]
+pub fn project_attributes<Fd: AsFd>(fd: Fd) -> Result<ProjectAttributes> {
+    let attributes = fsxattr_get(fd)?;
+    Ok(ProjectAttributes {
+        project_id: ProjectId::new(attributes.fsx_projid)?,
+        project_inherit: attributes.fsx_xflags & FS_XFLAG_PROJINHERIT != 0,
+    })
+}
+
+/// Assign a project identifier and inheritance bit while preserving all other
+/// filesystem project attributes.
+#[cfg(linux_android)]
+pub fn set_project_attributes<Fd: AsFd>(
+    fd: Fd,
+    project_id: ProjectId,
+    project_inherit: bool,
+) -> Result<()> {
+    let mut attributes = fsxattr_get(&fd)?;
+    set_project_values(&mut attributes, project_id, project_inherit);
+    fsxattr_set(fd, &attributes)
+}
+
+#[cfg(linux_android)]
+fn set_project_values(attributes: &mut Fsxattr, project_id: ProjectId, project_inherit: bool) {
+    attributes.fsx_projid = project_id.as_u32();
+    if project_inherit {
+        attributes.fsx_xflags |= FS_XFLAG_PROJINHERIT;
+    } else {
+        attributes.fsx_xflags &= !FS_XFLAG_PROJINHERIT;
+    }
+}
+
 /// Turn on disk quotas for a block device.
 pub fn quotactl_on<P: ?Sized + NixPath>(
     which: QuotaType,
@@ -318,6 +564,62 @@ pub fn quotactl_get<P: ?Sized + NixPath>(
     Ok(unsafe { Dqblk(dqblk.assume_init()) })
 }
 
+/// Read active project-quota information for a filesystem.
+///
+/// A successful `Q_GETINFO` with the flags validity bit proves that the kernel
+/// has an active project-quota interface for `special`; it is not inferred
+/// merely from the presence of a quota record.
+#[cfg(linux_android)]
+pub fn project_quota_active<P: ?Sized + NixPath>(special: &P) -> Result<ProjectQuotaInfo> {
+    let mut info = mem::MaybeUninit::<Dqinfo>::uninit();
+    quotactl(
+        QuotaCmd(QuotaSubCmd::Q_GETINFO, QuotaType::PRJQUOTA),
+        Some(special),
+        0,
+        info.as_mut_ptr().cast(),
+    )?;
+    let info = unsafe { info.assume_init() };
+    const IIF_FLAGS: u32 = 4;
+    if info.dqi_valid & IIF_FLAGS == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(ProjectQuotaInfo {
+        flags: info.dqi_flags,
+    })
+}
+
+/// Read finite exact project quota limits for `project_id`.
+#[cfg(linux_android)]
+pub fn project_quota<P: ?Sized + NixPath>(
+    special: &P,
+    project_id: ProjectId,
+) -> Result<ProjectQuota> {
+    let dqblk = quotactl_get(QuotaType::PRJQUOTA, special, project_id.as_u32() as c_int)?;
+    ProjectQuota::from_dqblk(&dqblk)
+}
+
+/// Set finite exact project quota limits for `project_id`.
+///
+/// Call [`project_quota_active`] first when setup needs to prove that project
+/// quota accounting is active before assigning limits.
+#[cfg(linux_android)]
+pub fn set_project_quota<P: ?Sized + NixPath>(
+    special: &P,
+    project_id: ProjectId,
+    quota: ProjectQuota,
+) -> Result<()> {
+    let mut dqblk = Dqblk::default();
+    dqblk.set_blocks_soft_limit(quota_blocks_from_bytes(quota.soft_limit_bytes())?);
+    dqblk.set_blocks_hard_limit(quota_blocks_from_bytes(quota.hard_limit_bytes())?);
+    quotactl_set(
+        QuotaType::PRJQUOTA,
+        special,
+        project_id.as_u32() as c_int,
+        &dqblk,
+        QuotaValidFlags::QIF_BLIMITS,
+    )
+}
+
 /// Configure quota values for the specified fields for a given user/group id.
 pub fn quotactl_set<P: ?Sized + NixPath>(
     which: QuotaType,
@@ -334,4 +636,102 @@ pub fn quotactl_set<P: ?Sized + NixPath>(
         id,
         &mut dqblk_copy as *mut _ as *mut c_char,
     )
+}
+
+#[cfg(all(test, linux_android))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_quota_command_uses_linux_project_selector() {
+        assert_eq!(
+            QuotaCmd(QuotaSubCmd::Q_GETQUOTA, QuotaType::PRJQUOTA).as_int(),
+            libc::QCMD(libc::Q_GETQUOTA, 2),
+        );
+    }
+
+    #[test]
+    fn fsxattr_layout_matches_linux_uapi() {
+        let attributes = Fsxattr::default();
+        let base = (&attributes as *const Fsxattr) as usize;
+        assert_eq!(mem::size_of::<Fsxattr>(), 28);
+        assert_eq!(mem::align_of::<Fsxattr>(), 4);
+        assert_eq!(ptr::addr_of!(attributes.fsx_xflags) as usize - base, 0);
+        assert_eq!(ptr::addr_of!(attributes.fsx_extsize) as usize - base, 4);
+        assert_eq!(ptr::addr_of!(attributes.fsx_nextents) as usize - base, 8);
+        assert_eq!(ptr::addr_of!(attributes.fsx_projid) as usize - base, 12);
+        assert_eq!(ptr::addr_of!(attributes.fsx_cowextsize) as usize - base, 16);
+        assert_eq!(ptr::addr_of!(attributes.fsx_pad) as usize - base, 20);
+    }
+
+    #[cfg(feature = "ioctl")]
+    #[test]
+    fn fsxattr_requests_match_ioctl_macros() {
+        assert_eq!(
+            FS_IOC_FSGETXATTR,
+            request_code_read!(b'X', 31, mem::size_of::<Fsxattr>()) as libc::Ioctl
+        );
+        assert_eq!(
+            FS_IOC_FSSETXATTR,
+            request_code_write!(b'X', 32, mem::size_of::<Fsxattr>()) as libc::Ioctl
+        );
+    }
+
+    #[cfg(target_arch = "sparc64")]
+    #[test]
+    fn fsxattr_requests_use_sparc64_legacy_encoding() {
+        assert_eq!(FS_IOC_FSGETXATTR as u64, 0x401c_581f);
+        assert_eq!(FS_IOC_FSSETXATTR as u64, 0x801c_5820);
+    }
+
+    #[test]
+    fn setting_project_values_preserves_other_fsxattr_fields() {
+        let mut attributes = Fsxattr {
+            fsx_xflags: 0x40,
+            fsx_extsize: 10,
+            fsx_nextents: 11,
+            fsx_projid: 12,
+            fsx_cowextsize: 13,
+            fsx_pad: [14; 8],
+        };
+        set_project_values(&mut attributes, ProjectId::new(42).unwrap(), true);
+        assert_eq!(attributes.fsx_projid, 42);
+        assert_eq!(attributes.fsx_xflags, 0x40 | FS_XFLAG_PROJINHERIT);
+        assert_eq!(attributes.fsx_extsize, 10);
+        assert_eq!(attributes.fsx_nextents, 11);
+        assert_eq!(attributes.fsx_cowextsize, 13);
+        assert_eq!(attributes.fsx_pad, [14; 8]);
+        set_project_values(&mut attributes, ProjectId::new(42).unwrap(), false);
+        assert_eq!(attributes.fsx_xflags, 0x40);
+    }
+
+    #[test]
+    fn project_id_boundaries_are_checked() {
+        assert_eq!(ProjectId::new(0).unwrap().as_u32(), 0);
+        assert_eq!(ProjectId::new(c_int::MAX as u32).unwrap().as_u32(), c_int::MAX as u32);
+        assert_eq!(ProjectId::new(c_int::MAX as u32 + 1), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn exact_quota_block_conversions() {
+        let sixteen_gib = 16 * 1024 * 1024 * 1024;
+        assert_eq!(quota_blocks_from_bytes(sixteen_gib), Ok(16_777_216));
+        assert_eq!(quota_bytes_from_blocks(16_777_216), Ok(sixteen_gib));
+        assert_eq!(quota_blocks_from_bytes(sixteen_gib - 1), Err(Errno::EINVAL));
+        assert_eq!(quota_blocks_from_bytes(sixteen_gib + 1), Err(Errno::EINVAL));
+        assert_eq!(quota_blocks_from_bytes(0), Err(Errno::EINVAL));
+        assert_eq!(quota_bytes_from_blocks(0), Err(Errno::EINVAL));
+        assert_eq!(quota_bytes_from_blocks(u64::MAX), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn project_quota_requires_limit_validity() {
+        let dqblk = Dqblk::default();
+        assert_eq!(ProjectQuota::from_dqblk(&dqblk), Err(Errno::EINVAL));
+        let mut dqblk = Dqblk::default();
+        dqblk.0.dqb_valid = QuotaValidFlags::QIF_BLIMITS.bits();
+        dqblk.0.dqb_bsoftlimit = 1;
+        dqblk.0.dqb_bhardlimit = 1;
+        assert_eq!(ProjectQuota::from_dqblk(&dqblk).unwrap().soft_limit_bytes(), 1024);
+    }
 }
