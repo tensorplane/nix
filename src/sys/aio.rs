@@ -10,18 +10,18 @@
 //! platform support.  Completion
 //! notifications can optionally be delivered via
 //! [signals](../signal/enum.SigevNotify.html#variant.SigevSignal), via the
-//! [`aio_suspend`](fn.aio_suspend.html) function, or via polling.  Some
+//! [`aio_suspend`] function, or via polling.  Some
 //! platforms support other completion
 //! notifications, such as
 //! [kevent](../signal/enum.SigevNotify.html#variant.SigevKevent).
 //!
 //! Multiple operations may be submitted in a batch with
-//! [`lio_listio`](fn.lio_listio.html), though the standard does not guarantee
+//! [`lio_listio`], though the standard does not guarantee
 //! that they will be executed atomically.
 //!
 //! Outstanding operations may be cancelled with
 //! [`cancel`](trait.Aio.html#method.cancel) or
-//! [`aio_cancel_all`](fn.aio_cancel_all.html), though the operating system may
+//! [`aio_cancel_all`], though the operating system may
 //! not support this for all filesystems and devices.
 #![allow(clippy::doc_overindented_list_items)] // It looks better this way
 #[cfg(target_os = "freebsd")]
@@ -64,19 +64,19 @@ libc_enum! {
 }
 
 libc_enum! {
-    /// Mode for [`lio_listio`](fn.lio_listio.html)
+    /// Mode for [`lio_listio`]
     #[repr(i32)]
     pub enum LioMode {
-        /// Requests that [`lio_listio`](fn.lio_listio.html) block until all
+        /// Requests that [`lio_listio`] block until all
         /// requested operations have been completed
         LIO_WAIT,
-        /// Requests that [`lio_listio`](fn.lio_listio.html) return immediately
+        /// Requests that [`lio_listio`] return immediately
         LIO_NOWAIT,
     }
 }
 
 /// Return values for [`AioCb::cancel`](struct.AioCb.html#method.cancel) and
-/// [`aio_cancel_all`](fn.aio_cancel_all.html)
+/// [`aio_cancel_all`]
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AioCancelStat {
@@ -1145,22 +1145,32 @@ pub fn aio_suspend(
 // Do not run this doc test on:
 //   * aarch64-unknown-linux-musl
 //   * i686-unknown-linux-musl
+//   * x86_64-unknown-linux-musl
 // because it hangs on these targets. After further debugging, we think this is
 // likely a bug of musl. Since we only test our bindings and do not intend to
 // fix the underlying libc bug, we skip this test here.
 // See this thread for the discussion of this issue:
-// https://github.com/nix-rust/nix/pull/2689#issuecomment-3419813159
+// 1. https://github.com/nix-rust/nix/pull/2689#issuecomment-3419813159
+// 2. https://github.com/nix-rust/nix/issues/2788
 #[cfg_attr(
     all(
         target_env = "musl",
-        any(target_arch = "aarch64", target_arch = "x86")
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )
     ),
     doc = " ```no_run"
 )]
 #[cfg_attr(
     not(all(
         target_env = "musl",
-        any(target_arch = "aarch64", target_arch = "x86")
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )
     )),
     doc = " ```"
 )]
