@@ -71,6 +71,7 @@ fn project_attributes_use_a_safe_descriptor_api() {
             Errno::EINVAL
                 | Errno::ENOTTY
                 | Errno::EOPNOTSUPP
+                | Errno::ENOSYS
                 | Errno::EPERM
                 | Errno::EACCES
         ));
