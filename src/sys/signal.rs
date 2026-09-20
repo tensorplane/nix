@@ -426,9 +426,7 @@ pub const SIGPOLL : Signal = SIGIO;
 pub const SIGUNUSED : Signal = SIGSYS;
 
 cfg_if! {
-    if #[cfg(target_os = "redox")] {
-        type SaFlags_t = libc::c_ulong;
-    } else if #[cfg(target_env = "uclibc")] {
+    if #[cfg(target_env = "uclibc")] {
         type SaFlags_t = libc::c_ulong;
     } else {
         type SaFlags_t = libc::c_int;
