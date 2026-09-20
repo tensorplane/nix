@@ -8,7 +8,7 @@ use crate::Result;
 /// This is a wrapper around `libc::pollfd`.
 ///
 /// It's meant to be used as an argument to the [`poll`] and
-/// [`ppoll`] functions to specify the events of interest
+/// `ppoll` functions to specify the events of interest
 /// for a specific file descriptor.
 ///
 /// After a call to `poll` or `ppoll`, the events that occurred can be retrieved by calling
@@ -34,7 +34,7 @@ impl<'fd> PollFd<'fd> {
     /// let (r, w) = pipe().unwrap();
     /// let pfd = PollFd::new(r.as_fd(), PollFlags::POLLIN);
     /// ```
-    /// These are placed in an array and passed to [`poll`] or [`ppoll`].
+    /// These are placed in an array and passed to [`poll`] or `ppoll`.
     // Unlike I/O functions, constructors like this must take `BorrowedFd`
     // instead of AsFd or &AsFd.  Otherwise, an `OwnedFd` argument would be
     // dropped at the end of the method, leaving the structure referencing a

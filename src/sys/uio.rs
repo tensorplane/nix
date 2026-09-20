@@ -147,8 +147,8 @@ pub fn pread<Fd: AsFd>(fd: Fd, buf: &mut [u8], offset: off_t) -> Result<usize> {
 /// This is the same underlying C structure as `IoSlice`,
 /// except that it refers to memory in some other process, and is
 /// therefore not represented in Rust by an actual slice as `IoSlice` is. It
-/// is used with [`process_vm_readv`]
-/// and [`process_vm_writev`].
+/// is used with `process_vm_readv`
+/// and `process_vm_writev`.
 #[cfg(linux_android)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
