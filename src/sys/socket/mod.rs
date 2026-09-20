@@ -123,7 +123,7 @@ impl TryFrom<i32> for SockType {
     }
 }
 
-/// Constants used in [`socket`](fn.socket.html) and [`socketpair`](fn.socketpair.html)
+/// Constants used in [`socket`] and [`socketpair`]
 /// to specify the protocol to use.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1760,7 +1760,7 @@ pub fn sendmsg<S>(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage],
 /// `Vec` with numbers of sent bytes on each sent message.
 ///
 /// # References
-/// [`sendmsg`](fn.sendmsg.html)
+/// [`sendmsg`]
 #[cfg(any(linux_android, target_os = "freebsd", target_os = "netbsd"))]
 pub fn sendmmsg<'a, XS, AS, C, I, S>(
     fd: RawFd,
