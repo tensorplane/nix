@@ -66,6 +66,98 @@ fn test_ptrace_setsiginfo() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_ptrace_seccomp_filter() {
+    use nix::sys::signal::{raise, Signal};
+    use nix::sys::wait::{waitpid, WaitStatus};
+    use nix::unistd::fork;
+    use nix::unistd::ForkResult::*;
+
+    require_capability!("test_ptrace_seccomp_filter", CAP_SYS_ADMIN);
+
+    let _m = crate::FORK_MTX.lock();
+
+    match unsafe { fork() }.expect("Error: Fork Failed") {
+        Child => {
+            ptrace::traceme().unwrap();
+
+            let mut filter = [libc::sock_filter {
+                code: libc::BPF_RET as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            }];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_mut_ptr(),
+            };
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &program,
+                    )
+                },
+                0
+            );
+            raise(Signal::SIGSTOP).unwrap();
+            loop {
+                raise(Signal::SIGSTOP).unwrap();
+            }
+        }
+        Parent { child } => {
+            assert_eq!(
+                waitpid(child, None),
+                Ok(WaitStatus::Stopped(child, Signal::SIGSTOP))
+            );
+
+            let filter = ptrace::get_seccomp_filter(child, 0).unwrap();
+            assert_eq!(
+                filter,
+                vec![libc::sock_filter {
+                    code: libc::BPF_RET as u16,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ALLOW,
+                }]
+            );
+            assert_eq!(
+                ptrace::get_seccomp_filter(child, 1),
+                Err(Errno::ENOENT)
+            );
+
+            ptrace::cont(child, Some(Signal::SIGKILL)).unwrap();
+            assert_eq!(
+                waitpid(child, None),
+                Ok(WaitStatus::Signaled(child, Signal::SIGKILL, false))
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_ptrace_seccomp_filter_requires_a_traced_stopped_tracee() {
+    let error = ptrace::get_seccomp_filter(getpid(), 0).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Errno::EACCES
+                | Errno::EPERM
+                | Errno::EINVAL
+                | Errno::ENOSYS
+                | Errno::ESRCH
+        ),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn test_ptrace_cont() {
     use nix::sys::ptrace;
