@@ -10,6 +10,15 @@ use std::{mem, ptr};
 
 pub type AddressType = *mut ::libc::c_void;
 
+// This request is part of the Linux ptrace UAPI but is not yet exposed by the
+// minimum supported libc version.
+#[cfg(target_os = "linux")]
+const PTRACE_SECCOMP_GET_FILTER: RequestType = 0x420c;
+
+// `BPF_MAXINSNS` from Linux UAPI `include/uapi/linux/bpf_common.h`.
+#[cfg(target_os = "linux")]
+const BPF_MAXINSNS: usize = 4096;
+
 #[cfg(all(
     target_os = "linux",
     any(
@@ -510,6 +519,190 @@ fn ptrace_get_data<T>(request: Request, pid: Pid) -> Result<T> {
     };
     Errno::result(res)?;
     Ok(unsafe { data.assume_init() })
+}
+
+#[cfg(target_os = "linux")]
+fn get_seccomp_filter_with<F>(mut get_filter: F) -> Result<Vec<libc::sock_filter>>
+where
+    F: FnMut(Option<&mut [mem::MaybeUninit<libc::sock_filter>]>) -> Result<c_long>,
+{
+    let length = get_filter(None)?;
+    let length = usize::try_from(length).map_err(|_| Errno::EIO)?;
+    if length == 0 || length > BPF_MAXINSNS {
+        return Err(Errno::EIO);
+    }
+
+    // PTRACE_SECCOMP_GET_FILTER does not receive a buffer length. Allocate the
+    // UAPI maximum so a filter that changes between the two calls cannot make
+    // the kernel write past this allocation.
+    let mut filter = Vec::with_capacity(BPF_MAXINSNS);
+    let read_length = get_filter(Some(filter.spare_capacity_mut()))?;
+    let read_length = usize::try_from(read_length).map_err(|_| Errno::EIO)?;
+
+    if read_length == 0 || read_length > BPF_MAXINSNS || read_length != length {
+        return Err(Errno::EIO);
+    }
+
+    // The kernel reported that it wrote exactly `length` complete instructions.
+    unsafe {
+        filter.set_len(length);
+    }
+    Ok(filter)
+}
+
+#[cfg(target_os = "linux")]
+fn ptrace_seccomp_get_filter(
+    pid: Pid,
+    filter_index: usize,
+    filter: *mut libc::sock_filter,
+) -> Result<c_long> {
+    unsafe {
+        Errno::result(libc::ptrace(
+            PTRACE_SECCOMP_GET_FILTER,
+            libc::pid_t::from(pid),
+            filter_index as AddressType,
+            filter.cast::<c_void>(),
+        ))
+    }
+}
+
+/// Gets a seccomp classic-BPF filter from an already-stopped tracee, as with
+/// `ptrace(PTRACE_SECCOMP_GET_FILTER, ...)`.
+///
+/// `pid` must identify the tracee that the caller is already tracing, and that
+/// tracee must remain stopped for both reads performed by this function.
+/// `filter_index` is the kernel's zero-based index for the requested filter.
+/// The caller retains ownership of the tracee lifecycle, including detaching
+/// and resuming it.
+///
+/// Returns the exact sequence of `sock_filter` instructions. Kernel errors,
+/// including permission failures and unsupported requests, are returned
+/// unchanged. If the filter length changes between the length query and the
+/// read, this returns `Errno::EIO` rather than returning a partial filter.
+#[cfg(target_os = "linux")]
+pub fn get_seccomp_filter(
+    pid: Pid,
+    filter_index: usize,
+) -> Result<Vec<libc::sock_filter>> {
+    get_seccomp_filter_with(|filter| {
+        ptrace_seccomp_get_filter(
+            pid,
+            filter_index,
+            filter.map_or(ptr::null_mut(), |filter| filter.as_mut_ptr().cast()),
+        )
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn allow() -> libc::sock_filter {
+        libc::sock_filter {
+            code: libc::BPF_RET as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }
+    }
+
+    #[test]
+    fn seccomp_filter_returns_the_full_readback() {
+        let expected = allow();
+        let mut call_count = 0;
+        let actual = get_seccomp_filter_with(|filter| {
+            call_count += 1;
+            match call_count {
+                1 => {
+                    assert!(filter.is_none());
+                    Ok(1)
+                }
+                2 => {
+                    let filter = filter.unwrap();
+                    assert_eq!(filter.len(), BPF_MAXINSNS);
+                    filter[0].write(expected);
+                    Ok(1)
+                }
+                _ => unreachable!(),
+            }
+        });
+
+        assert_eq!(actual.unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn seccomp_filter_rejects_a_short_second_read() {
+        let mut call_count = 0;
+        let error = get_seccomp_filter_with(|filter| {
+            call_count += 1;
+            match call_count {
+                1 => {
+                    assert!(filter.is_none());
+                    Ok(2)
+                }
+                2 => {
+                    assert_eq!(filter.unwrap().len(), BPF_MAXINSNS);
+                    Ok(1)
+                }
+                _ => unreachable!(),
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error, Errno::EIO);
+    }
+
+    #[test]
+    fn seccomp_filter_rejects_a_growing_second_read_with_a_maximum_safe_buffer() {
+        let mut call_count = 0;
+        let error = get_seccomp_filter_with(|filter| {
+            call_count += 1;
+            match call_count {
+                1 => {
+                    assert!(filter.is_none());
+                    Ok(1)
+                }
+                2 => {
+                    assert_eq!(filter.unwrap().len(), BPF_MAXINSNS);
+                    // Do not write: the result reports a filter that grew after
+                    // the length query. The capacity assertion proves this seam
+                    // cannot receive an undersized raw buffer.
+                    Ok(2)
+                }
+                _ => unreachable!(),
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error, Errno::EIO);
+    }
+
+    #[test]
+    fn seccomp_filter_rejects_zero_or_oversized_length_before_reading() {
+        for length in [0, (BPF_MAXINSNS + 1) as c_long] {
+            let mut call_count = 0;
+            let error = get_seccomp_filter_with(|filter| {
+                call_count += 1;
+                assert_eq!(call_count, 1, "invalid length must not be read");
+                assert!(filter.is_none());
+                Ok(length)
+            })
+            .unwrap_err();
+
+            assert_eq!(error, Errno::EIO);
+        }
+    }
+
+    #[test]
+    fn seccomp_filter_preserves_permission_errors() {
+        let error = get_seccomp_filter_with(|filter| {
+            assert!(filter.is_none());
+            Err(Errno::EACCES)
+        })
+        .unwrap_err();
+
+        assert_eq!(error, Errno::EACCES);
+    }
 }
 
 unsafe fn ptrace_other(
